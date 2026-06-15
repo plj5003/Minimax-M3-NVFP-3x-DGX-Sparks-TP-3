@@ -312,6 +312,12 @@ clears a stuck NIC/PHY state. Gracefully shut down all 3 Sparks, **unplug the po
 seconds**, then power back on. After the drain, `ib_write_bw` jumped to **111.85 Gb/s** (full line rate,
 matching eugr's reference). **A warm reboot does NOT clear it; only pulling power does.**
 
+> **Reboot gotcha:** a full power-cycle (or any reboot) reverts the ConnectX-7 **runtime MTU 9000 -> 1500**.
+> Re-apply the jumbo MTU with `ip link set <ifname> mtu 9000` after boot (the netplan `/30` mesh and the
+> committed NCCL image persist; only the runtime MTU resets). Also note: the **first vLLM boot after a
+> power-drain loads shards slower** (cold page cache) and can transiently stall mid-load - a plain restart
+> (stop all + relaunch worker-first) clears it; it is not a regression.
+
 ### Results
 
 - **TP=3 MiniMax-M3-NVFP4 serving over RoCE at 200K context, tool-calling clean.**
