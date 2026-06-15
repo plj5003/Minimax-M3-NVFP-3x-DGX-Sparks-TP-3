@@ -128,7 +128,7 @@ docker start vllm_m3        # (or: docker run ... bash /m3vllm.sh worker)
 docker start vllm_m3        # CMD = bash /m3vllm.sh leader
 ```
 
-Bring-up ≈ 10–12 min (per-node 84 GB shard load + torch.compile + warmup + PIECEWISE cudagraph capture).
+Bring-up is about 10 to 12 min (per-node 84 GB shard load + torch.compile + warmup + PIECEWISE cudagraph capture).
 A quiet stretch during safetensors load is normal - do not kill it.
 
 ## Verification (the whole point - tool-calling clean)
@@ -151,24 +151,132 @@ under the `reasoning` key (not `reasoning_content`) - content carries the clean 
 - **NCCL is running over the 1 GbE management NIC (`enP7s7`).** TP=3 does ~120 cross-node all-reduces per
   token; over 1 Gbps that dominates. (This is also why a PP=3 setup can feel faster single-stream - PP
   only passes the hidden state twice per token.) The 200 G ConnectX-7 ports sit unused for model traffic.
-- **RoCE over the 200 G ring (the real fix, in progress):** the 3 Sparks cable into a triangle
-  (two QSFP ports each, no switch). Naively pointing NCCL at RoCE **fails** because a single global
-  `NCCL_IB_GID_INDEX` can't describe point-to-point /30 links and NCCL pairs the wrong HCA→peer
-  (`ibv_modify_qp ... 110 Connection timed out`). Working approach: give each leg a static /30, remove
-  zeroconf 169.254 addrs so the RoCE-v2 GID is at a consistent index, then **unset `NCCL_IB_GID_INDEX`**
-  and let NCCL pick per-connection via `NCCL_IB_ADDR_RANGE=<fabric CIDR>` + `NCCL_IB_ADDR_FAMILY=AF_INET`,
-  with `NCCL_IB_HCA=<cabled HCAs only>`, `NCCL_CROSS_NIC=1`, and **`NCCL_NET_GDR_LEVEL=0`** (mandatory on
-  GB10 - unified memory breaks GPU-Direct RDMA). NVIDIA flags switchless-3-node NCCL as a manual-build
-  rough edge; a small RoCE switch (one common /24) is the fully-supported fallback.
-- **EAGLE3 speculative decoding (M3 has no native MTP):** the chthonic M3 class implements `SupportsEagle3`,
-  and `Inferact/MiniMax-M3-EAGLE3` loads - set `draft_tensor_parallel_size:1` (the draft's 64 heads aren't
-  ÷3 and don't get virtual-TP padding). Current blocker: the bf16 draft has no quant config, so vLLM tries
-  to apply the **NVFP4** target quant to it and `get_quant_config` dead-ends (`hf_overrides must be a dict`).
-  Open: ship the draft a small fp8 quant config, or wait for a pre-quantized eagle3 draft.
+- Two speed levers are documented in full below, with their exact current state:
+  - **[Phase 2: EAGLE3 speculative decoding](#phase-2---eagle3-speculative-decoding-works-modest-gain-on-1gbe)** - working, about +25% single-stream over base.
+  - **[Phase 3: RoCE 200G interconnect](#phase-3---roce-200g-interconnect-the-real-bottleneck-work-in-progress)** - the real bottleneck, work in progress.
+
+This is a living recipe. The two phases below are where the gains are, and where there is still room to tinker.
+If you push past what we measured, please open an issue or PR.
+
+---
+
+## Phase 2 - EAGLE3 speculative decoding (works, modest gain on 1GbE)
+
+MiniMax-M3 has **no native MTP / speculative weights**: the `MiniMaxM3MTP` architecture exists in the model
+code but ships **zero trained weights**. So we drive an **external EAGLE3 draft**:
+[`Inferact/MiniMax-M3-EAGLE3`](https://huggingface.co/Inferact/MiniMax-M3-EAGLE3), a 1-layer
+`LlamaForCausalLMEagle3` (num_attention_heads 64, hidden_size 6144, head_dim 128).
+
+Getting that draft to load on **TP=3** meant clearing **four distinct walls, in order**:
+
+1. **`SpeculativeConfig` divisibility error** -> set **`draft_tensor_parallel_size: 1`**. Run the draft on a
+   single GPU instead of splitting it across all 3 ranks.
+2. **Quantization error (`hf_overrides must be a dict`)** -> **omit `quantization` from the speculative-config**
+   so the draft loads in **bf16**. The draft is tiny, there is no need to quantize it (and trying to apply the
+   target's NVFP4 quant to it is what dead-ends).
+3. **Draft construction assert (num_heads not divisible by TP=3) in `llama_eagle3.py`** -> **pad the draft from
+   64 to 96 attention heads.** 96 is the **only** valid target, because it must satisfy **both**:
+   - transformers config validation: `hidden_size % num_heads == 0` -> `6144 / 96 == 64` (OK), and
+   - TP divisibility: `96 / 3 == 32` (OK).
+   The naive head_dim-based guess of **66 heads FAILS** transformers config validation:
+   `"hidden size (6144) is not a multiple of the number of attention heads (66)"`. The padding zero-fills the
+   q/k/v_proj **out-features 8192 -> 12288** and the o_proj **in-features 8192 -> 12288**, in **bf16**, and
+   leaves every other tensor untouched. See **`pad_eagle3_draft.py`** in this repo; we built the result as
+   **`MiniMax-M3-EAGLE3-pad96`**. (`validate_eagle3_pad.py` and `validate_eagle3_real_tp3.py` dry-check the
+   padded shapes + run the real vLLM TP=3 weight loaders against them.)
+4. **Draft attention backend.** The draft inherits the engine's **fp8 KV cache** (`--kv-cache-dtype fp8_e4m3`)
+   **and block-size 128**. With that combo: `FLASH_ATTN` is rejected (`kv_cache_dtype not supported`), and
+   `FLASHINFER` is rejected at block-size 128 (`page size >= 128 requires trtllm-gen attention`).
+   **`TRITON_ATTN`** is the one backend valid for `(head_dim 128, fp8 KV, block 128)` on **sm_121**, confirmed
+   by running vLLM's own backend validator. So set **`"attention_backend": "TRITON_ATTN"`** in the
+   speculative-config.
+
+**Working speculative-config** (add to the `vllm serve` command):
+
+```bash
+--speculative-config '{"model": "/path/to/MiniMax-M3-EAGLE3-pad96", "method": "eagle3", "num_speculative_tokens": 3, "draft_tensor_parallel_size": 1, "attention_backend": "TRITON_ATTN"}'
+```
+
+**Note:** with EAGLE3 on, the KV cache is slightly tighter, so drop `--max-model-len` from **200000 to 128000**.
+(A `131072` attempt failed by ~80 MB of KV; the engine reported a max feasible of `129408`.)
+
+**Results (single stream, TP=3 over the 1 GbE management link):**
+
+| config | single-stream | note |
+|---|---|---|
+| base M3 (no speculation) | ~6 tok/s | baseline |
+| EAGLE3 + `enforce-eager` | ~6.3 tok/s | the eager penalty cancels the speculation gain |
+| EAGLE3 + cudagraph (PIECEWISE) @ 128K | **~7.5 tok/s** | **about +25% over base** |
+
+At PIECEWISE @ 128K: mean acceptance length ~2.6, draft accept rate ~55%, per-position ~0.73 / 0.55 / 0.34.
+Tool-calling stays clean (no token leak).
+
+**Key insight:** the draft correctly predicts ~2.6 tokens per step, but that does **not** become a ~2.4x
+speedup, because **TP=3 is communication-bound on the 1 GbE link** (roughly 120 small all-reduces per token).
+Speculation gives you the tokens; the slow interconnect eats the savings. That is exactly why the
+**interconnect (Phase 3) is the real lever**, and EAGLE3 is a **+25% bonus on top of it**.
+
+---
+
+## Phase 3 - RoCE 200G interconnect (the real bottleneck, work in progress)
+
+The **1 GbE management NIC is the true bottleneck** for TP=3. Each of the 3 Sparks has a **ConnectX-7
+(200 G class)**. Credit to **eugr** (`eugr/spark-vllm-docker`, `docs/NETWORKING.md`) and the **NVIDIA DGX
+Spark forum** thread for the recipe.
+
+**The gating fix: `NCCL_IB_SUBNET_AWARE_ROUTING`.** It is needed so NCCL maps each rank-pair to the correct
+cable on a **switchless point-to-point mesh**; without it you get `ibv_modify_qp` **err 110** from
+cross-paired HCAs. This option was **introduced in NCCL 2.30**. Luke Alonso's container ships **NCCL 2.29.7**,
+which lacks it. So we build **NCCL v2.30u1 from source** for **sm_121** and swap it in.
+
+Build steps (see `nccl230-build.sh` + `nccl230-inner-build.sh`, which build in a throwaway container and
+`docker commit` a new image tag; `nccl-build-watcher.sh` polls all 3 nodes for DONE/FAIL):
+
+```bash
+git clone --depth 1 -b v2.30u1 https://github.com/NVIDIA/nccl.git
+cd nccl && make -j src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"
+```
+
+Then override the pip-bundled libnccl: `rm` and symlink
+`/opt/venv/.../nvidia/nccl/lib/libnccl.so.2 -> /opt/nccl230/build/lib/libnccl.so.2`, then `docker commit`
+a new image tag.
+
+**Verify the runtime version with ctypes `ncclGetVersion`, NOT `torch.cuda.nccl.version()`** (the latter
+reports the **compile-time constant 2.29.7** and is misleading). We confirmed **runtime NCCL 2.30.7** with the
+**subnet-aware-routing symbol present**.
+
+**The 3-node switchless ring:** each node's two slot-1 RoCE ports reach its two neighbors, each leg on its own
+**/30 subnet**, **RoCEv2 GID index 3**. The RoCE NCCL env block (see `m3vllm-roce.sh`):
+
+```bash
+NCCL_IB_DISABLE=0
+NCCL_IB_HCA=rocep1s0f0,rocep1s0f1
+NCCL_IB_GID_INDEX=3
+NCCL_IB_MERGE_NICS=0
+NCCL_NET_PLUGIN=none
+NCCL_IB_SUBNET_AWARE_ROUTING=1
+NCCL_SOCKET_IFNAME=enP7s7   # bootstrap/control stays on the 1GbE mgmt; data rides RoCE
+```
+
+**Status (honest, in progress):**
+
+- **NCCL 2.30.7 built + verified on all 3 nodes.** The RoCE ring is **physically wired and every leg pings clean**.
+- **Raw single-link `ib_write_bw` currently measures about 12.8 Gb/s** and does **not** scale with queue-pair
+  count, which is well below the **~111 Gb/s** the eugr doc reports for one twin.
+- PCIe is **Gen5 x4 full width** and the link **negotiates 200 G**, so the hardware is healthy. We are
+  investigating whether the raw test is traversing the intended RoCE twin/subnet path.
+- The **end-to-end vLLM-on-RoCE bring-up is being tested now**; final inference throughput numbers will be
+  added when measured.
+- PFC / DCB / ECN / firmware tuning appears **not** to be required per the doc (111 G is reported as working
+  out of the box after correct twin / subnet / port alignment).
+
+**Invite to tinker:** if you have pushed past ~12.8 Gb/s on a switchless 3-Spark RoCE mesh, or have the EAGLE3
+draft beating +25%, please open an issue or PR.
 
 ## Credits
 
 Luke Alonso (`local-inference-lab/vllm` chthonic fork + `b12x` + the `MiniMax-M3-NVFP4` quant + the
-`fb63c9a` TP3 virtual-sharding commit). eugr's Spark vLLM work. The NVIDIA DGX Spark forum community
-(thread *"MiniMax M3 NVFP4 for quad DGX Spark"*). Recipe assembled + the OOM/Ray fixes diagnosed on a
-live 3-Spark cluster, 2026-06-15.
+`fb63c9a` TP3 virtual-sharding commit). eugr (`eugr/spark-vllm-docker`, `docs/NETWORKING.md`) for the
+switchless 3-Spark RoCE mesh recipe (Phase 3). Inferact for the `MiniMax-M3-EAGLE3` draft (Phase 2).
+The NVIDIA DGX Spark forum community (thread *"MiniMax M3 NVFP4 for quad DGX Spark"*). Recipe assembled,
+OOM/Ray fixes diagnosed, and Phase 2 + Phase 3 added on a live 3-Spark cluster, 2026-06-15.

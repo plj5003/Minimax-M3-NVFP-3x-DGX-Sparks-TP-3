@@ -87,6 +87,13 @@ for i in $(seq 1 90); do
 done
 ray status 2>&1 | tail -20
 
+# Phase 2 (OPTIONAL) EAGLE3 speculative decoding (~+25% single-stream over base).
+# M3 ships NO trained MTP weights, so we drive an external EAGLE3 draft. To enable:
+#   1. build the padded draft once: python pad_eagle3_draft.py  (64 -> 96 heads, see README Phase 2)
+#   2. drop --max-model-len from 200000 to 128000 (the draft KV makes 131072 fail by ~80MB)
+#   3. add the --speculative-config line shown below to the vllm serve args.
+# SPEC_CFG='{"model": "/cache/huggingface/MiniMax-M3-EAGLE3-pad96", "method": "eagle3", "num_speculative_tokens": 3, "draft_tensor_parallel_size": 1, "attention_backend": "TRITON_ATTN"}'
+
 exec vllm serve lukealonso/MiniMax-M3-NVFP4 \
   --served-model-name minimax-m3 \
   --host 0.0.0.0 --port 8000 \
@@ -112,3 +119,5 @@ exec vllm serve lukealonso/MiniMax-M3-NVFP4 \
   --reasoning-parser minimax_m3 \
   --enable-auto-tool-choice \
   --tool-call-parser minimax_m3
+  # Phase 2: append the next line (and set --max-model-len 128000 above) to turn on EAGLE3:
+  #   --speculative-config "$SPEC_CFG"
