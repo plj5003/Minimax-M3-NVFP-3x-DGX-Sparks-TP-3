@@ -7,9 +7,11 @@ namespace-token leaks). Built on **Luke Alonso's vLLM fork** (the `chthonic` bui
 This documents the parts that aren't in any existing guide: the **head-node OOM fixes** and the
 **multi-node Ray/NCCL setup** that took this from "crashes at warmup" to "serving + tool-calling clean."
 
-> Status: **base TP=3 serving is verified.** Single-stream throughput is modest (~6 tok/s) and the
-> bottleneck is the inter-node interconnect, not compute - see [Performance](#performance--whats-next).
-> Two speed levers (RoCE, EAGLE3) are documented at the bottom with their exact current state.
+> Status: **base TP=3 serving is verified, and the RoCE 200G interconnect is now SOLVED** (2026-06-15).
+> On the 1 GbE management link single-stream is modest (~6 tok/s); moving NCCL onto the 200G RoCE mesh
+> lifts that to ~10.5 tok/s (+75%). See [Performance](#performance--whats-next) and
+> [Phase 3](#phase-3---roce-200g-interconnect-solved-2026-06-15). Two speed levers (RoCE, EAGLE3) are
+> documented at the bottom with their exact, verified state.
 
 ---
 
@@ -145,22 +147,26 @@ under the `reasoning` key (not `reasoning_content`) - content carries the clean 
 
 ## Performance + what's next
 
-- **Single-stream ~6 tok/s, ~10 tok/s aggregate @ 4 concurrent.** Modest - and the bottleneck is the
-  **interconnect, not compute**: enabling CUDA graphs only moved single-stream +0.3 tok/s, proving the
-  time is spent waiting on the cross-node all-reduce.
-- **NCCL is running over the 1 GbE management NIC (`enP7s7`).** TP=3 does ~120 cross-node all-reduces per
-  token; over 1 Gbps that dominates. (This is also why a PP=3 setup can feel faster single-stream - PP
-  only passes the hidden state twice per token.) The 200 G ConnectX-7 ports sit unused for model traffic.
-- Two speed levers are documented in full below, with their exact current state:
-  - **[Phase 2: EAGLE3 speculative decoding](#phase-2---eagle3-speculative-decoding-works-modest-gain-on-1gbe)** - working, about +25% single-stream over base.
-  - **[Phase 3: RoCE 200G interconnect](#phase-3---roce-200g-interconnect-the-real-bottleneck-work-in-progress)** - the real bottleneck, work in progress.
+- **On the 1 GbE management link: single-stream ~6 tok/s, ~10 tok/s aggregate @ 4 concurrent.** Modest, and
+  the bottleneck there is the **interconnect, not compute**: enabling CUDA graphs only moved single-stream
+  +0.3 tok/s, proving the time is spent waiting on the cross-node all-reduce.
+- TP=3 does ~120 cross-node all-reduces per token; over 1 Gbps that dominates. (This is also why a PP=3
+  setup can feel comparable single-stream, PP only passes the hidden state twice per token.) Each Spark
+  also has a **200 G ConnectX-7**, which we have now moved the model traffic onto (Phase 3, below).
+- **On the 200 G RoCE mesh: single-stream ~10.5 tok/s (+75% over the 1 GbE link).** Once on RoCE the
+  single-stream path becomes **GPU-compute-bound**, so raw interconnect bandwidth beyond ~13 Gb/s does
+  not raise single-stream further (see Phase 3 for the honest detail). The full bandwidth pays off for
+  **concurrency / aggregate throughput**, which at high context is bounded by KV-cache memory.
+- Two speed levers are documented in full below, with their exact, verified state:
+  - **[Phase 2: EAGLE3 speculative decoding](#phase-2---eagle3-speculative-decoding-works-stacks-on-roce)** - working, about +25% single-stream, stacks on top of RoCE.
+  - **[Phase 3: RoCE 200G interconnect](#phase-3---roce-200g-interconnect-solved-2026-06-15)** - SOLVED 2026-06-15.
 
 This is a living recipe. The two phases below are where the gains are, and where there is still room to tinker.
 If you push past what we measured, please open an issue or PR.
 
 ---
 
-## Phase 2 - EAGLE3 speculative decoding (works, modest gain on 1GbE)
+## Phase 2 - EAGLE3 speculative decoding (works, stacks on RoCE)
 
 MiniMax-M3 has **no native MTP / speculative weights**: the `MiniMaxM3MTP` architecture exists in the model
 code but ships **zero trained weights**. So we drive an **external EAGLE3 draft**:
@@ -211,72 +217,120 @@ Getting that draft to load on **TP=3** meant clearing **four distinct walls, in 
 At PIECEWISE @ 128K: mean acceptance length ~2.6, draft accept rate ~55%, per-position ~0.73 / 0.55 / 0.34.
 Tool-calling stays clean (no token leak).
 
-**Key insight:** the draft correctly predicts ~2.6 tokens per step, but that does **not** become a ~2.4x
-speedup, because **TP=3 is communication-bound on the 1 GbE link** (roughly 120 small all-reduces per token).
-Speculation gives you the tokens; the slow interconnect eats the savings. That is exactly why the
-**interconnect (Phase 3) is the real lever**, and EAGLE3 is a **+25% bonus on top of it**.
+**Key insight:** the draft correctly predicts ~2.6 tokens per step, but on the **1 GbE link** that does
+**not** become a ~2.4x speedup, because TP=3 is communication-bound there (roughly 120 small all-reduces
+per token). Speculation gives you the tokens; the slow interconnect eats the savings. That is exactly why
+the **interconnect (Phase 3) was the first lever to pull**, and it is now solved. EAGLE3's **+25% stacks on
+top of RoCE** on the single-stream path.
 
 ---
 
-## Phase 3 - RoCE 200G interconnect (the real bottleneck, work in progress)
+## Phase 3 - RoCE 200G interconnect (SOLVED 2026-06-15)
 
-The **1 GbE management NIC is the true bottleneck** for TP=3. Each of the 3 Sparks has a **ConnectX-7
-(200 G class)**. Credit to **eugr** (`eugr/spark-vllm-docker`, `docs/NETWORKING.md`) and the **NVIDIA DGX
-Spark forum** thread for the recipe.
+**Goal:** move NCCL / vLLM TP=3 model traffic off the 1 GbE management link and onto the **200 G
+ConnectX-7 RoCE mesh**. Each of the 3 Sparks has a ConnectX-7; the 3 nodes form a **switchless
+point-to-point mesh** (no switch), each leg on its own **/30 subnet** (192.168.100 / 101 / 102),
+**RoCEv2 GID index 3**. Credit to **eugr** (`eugr/spark-vllm-docker`, `docs/NETWORKING.md`) for the core
+recipe, the **NVIDIA DGX Spark forum**, and a **ChatGPT-assisted debugging pass** that isolated the shim
+problem below.
 
-**The gating fix: `NCCL_IB_SUBNET_AWARE_ROUTING`.** It is needed so NCCL maps each rank-pair to the correct
-cable on a **switchless point-to-point mesh**; without it you get `ibv_modify_qp` **err 110** from
-cross-paired HCAs. This option was **introduced in NCCL 2.30**. Luke Alonso's container ships **NCCL 2.29.7**,
-which lacks it. So we build **NCCL v2.30u1 from source** for **sm_121** and swap it in.
+This is now **serving**. Two fixes cracked it, and the second one is the genuinely non-obvious,
+community-useful finding.
 
-Build steps (see `nccl230-build.sh` + `nccl230-inner-build.sh`, which build in a throwaway container and
-`docker commit` a new image tag; `nccl-build-watcher.sh` polls all 3 nodes for DONE/FAIL):
+### Fix 1 - NCCL version (build v2.30u1 from source for sm_121)
+
+The gating env is **`NCCL_IB_SUBNET_AWARE_ROUTING`**, which makes NCCL map each rank-pair to the correct
+cable on the switchless mesh. It was **introduced in NCCL 2.30**. Luke Alonso's container shipped **NCCL
+2.29.7**, which lacks it. So we built **NVIDIA NCCL tag `v2.30u1` from source** for **sm_121** and committed
+a new image tag, **`vllm-m3-chthonic:nccl230u1`**.
+
+Build (see `nccl230-build.sh` + `nccl230-inner-build.sh`, which build inside a throwaway container and
+`docker commit` the new tag; `nccl-build-watcher.sh` polls all 3 nodes for DONE/FAIL):
 
 ```bash
 git clone --depth 1 -b v2.30u1 https://github.com/NVIDIA/nccl.git
 cd nccl && make -j src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"
+# installs to /opt/nccl230/build/lib inside the committed image
 ```
 
-Then override the pip-bundled libnccl: `rm` and symlink
-`/opt/venv/.../nvidia/nccl/lib/libnccl.so.2 -> /opt/nccl230/build/lib/libnccl.so.2`, then `docker commit`
-a new image tag.
-
 **Verify the runtime version with ctypes `ncclGetVersion`, NOT `torch.cuda.nccl.version()`** (the latter
-reports the **compile-time constant 2.29.7** and is misleading). We confirmed **runtime NCCL 2.30.7** with the
-**subnet-aware-routing symbol present**.
+reports the **compile-time constant** and is misleading).
 
-**The 3-node switchless ring:** each node's two slot-1 RoCE ports reach its two neighbors, each leg on its own
-**/30 subnet**, **RoCEv2 GID index 3**. The RoCE NCCL env block (see `m3vllm-roce.sh`):
+### Fix 2 - the baked LD_PRELOAD shim (the non-obvious one)
+
+Building 2.30u1 and symlinking it in **was not enough**: the runtime NCCL banner kept reading **2.30.4**,
+and the **`ibv_modify_qp` err 110** cross-pairing persisted, even though 2.30u1 was installed on disk.
+
+The cause: the vLLM container had a **baked `LD_PRELOAD`** pointing at an **old local-inference NCCL shim**
+(`libnccl-local-inference.so.2.30.4`). A baked `LD_PRELOAD` **overrides both a symlink swap AND an
+`LD_LIBRARY_PATH` prepend**, so the container silently kept running the 2.30.4 shim. That shim lacked the
+working subnet-aware device-override, which is exactly what produced the persistent err-110 cross-pairing on
+the switchless mesh (the err-110 was a symptom of the wrong library, not a wiring fault).
+
+The fix, applied in the RoCE launcher **after** the `pip install` steps (which themselves reinstall the
+nvidia-nccl wheel and clobber the symlink, so this must run last):
+
+```bash
+export LD_PRELOAD=/opt/nccl230/build/lib/libnccl.so.2
+unset VLLM_NCCL_SO_PATH NCCL_LOCAL_INFERENCE_PATH NCCL_PR2127_PATH
+export LD_LIBRARY_PATH=/opt/nccl230/build/lib:$LD_LIBRARY_PATH
+```
+
+Then verify: the launcher should print **`FORCED_NCCL_VERSION 23007`** and the NCCL banner should read
+**`NCCL version 2.30.7`**. With the right library actually loaded, NCCL logs **`Connected all rings`** over
+**NET/IB** with **zero err-110**.
+
+### The RoCE NCCL env block (in `m3vllm-roce.sh`)
 
 ```bash
 NCCL_IB_DISABLE=0
-NCCL_IB_HCA=rocep1s0f0,rocep1s0f1
-NCCL_IB_GID_INDEX=3
+NCCL_NET=IB
+NCCL_SOCKET_IFNAME=enP7s7              # bootstrap/control on the 1GbE mgmt NIC (OOB); DATA rides RoCE
+NCCL_IB_HCA=rocep1s0f0,rocep1s0f1      # each node's two slot-1 RoCE ports reach its two neighbors
+NCCL_IB_ADDR_RANGE=192.168.100.0/22
+NCCL_IB_SUBNET_AWARE_ROUTING=1
 NCCL_IB_MERGE_NICS=0
 NCCL_NET_PLUGIN=none
-NCCL_IB_SUBNET_AWARE_ROUTING=1
-NCCL_SOCKET_IFNAME=enP7s7   # bootstrap/control stays on the 1GbE mgmt; data rides RoCE
+NCCL_CROSS_NIC=1                       # asymmetric mesh: each rocep1s0f0 faces a different neighbor
+NCCL_NET_GDR_LEVEL=LOC                 # disable GPUDirect RDMA (GB10 unified-memory safety)
+NCCL_IB_ADDR_FAMILY=AF_INET
+NCCL_IB_ROCE_VERSION_NUM=2
+# Do NOT hardcode NCCL_IB_GID_INDEX. Leave it default so dynamic per-peer GID selection works WITH
+# NCCL_IB_ADDR_RANGE. Hardcoding GID_INDEX=3 disables that and re-introduces the err-110 cross-pairing.
 ```
 
-**Status (honest, in progress):**
+The leave-GID-default point matters: `NCCL_IB_ADDR_RANGE` only steers GID selection when the GID index is
+**unset**. That dynamic, CIDR-driven selection is how subnet-aware-routing pairs the right local HCA to each
+neighbor on the switchless /30 mesh. (Underneath, the mesh is RoCEv2 at GID index 3, but you let NCCL find
+it rather than pin it.)
 
-- **NCCL 2.30.7 built + verified on all 3 nodes.** The RoCE ring is **physically wired and every leg pings clean**.
-- **Raw single-link `ib_write_bw` currently measures about 12.8 Gb/s** and does **not** scale with queue-pair
-  count, which is well below the **~111 Gb/s** the eugr doc reports for one twin.
-- PCIe is **Gen5 x4 full width** and the link **negotiates 200 G**, so the hardware is healthy. We are
-  investigating whether the raw test is traversing the intended RoCE twin/subnet path.
-- The **end-to-end vLLM-on-RoCE bring-up is being tested now**; final inference throughput numbers will be
-  added when measured.
-- PFC / DCB / ECN / firmware tuning appears **not** to be required per the doc (111 G is reported as working
-  out of the box after correct twin / subnet / port alignment).
+### The bandwidth gotcha - a COLD POWER-DRAIN, not a warm reboot (credit: mashie)
 
-**Invite to tinker:** if you have pushed past ~12.8 Gb/s on a switchless 3-Spark RoCE mesh, or have the EAGLE3
-draft beating +25%, please open an issue or PR.
+Raw `ib_write_bw` was initially stuck at **~12.8 Gb/s** and **did not scale with queue-pair count**, on
+otherwise-healthy **Gen5 x4 / 200 G** hardware. Forum user **mashie** had the answer: a **cold power-drain**
+clears a stuck NIC/PHY state. Gracefully shut down all 3 Sparks, **unplug the power bricks for 60-90
+seconds**, then power back on. After the drain, `ib_write_bw` jumped to **111.85 Gb/s** (full line rate,
+matching eugr's reference). **A warm reboot does NOT clear it; only pulling power does.**
+
+### Results
+
+- **TP=3 MiniMax-M3-NVFP4 serving over RoCE at 200K context, tool-calling clean.**
+- **Single-stream ~10.5 tok/s** vs **~6 tok/s on the 1 GbE mgmt link (+75%)**, which matches the old PP=3.
+- **Honest finding:** once on RoCE, single-stream is **GPU-compute-bound**, so interconnect bandwidth beyond
+  ~13 Gb/s does **not** raise single-stream. **12.8 Gb/s and 111 Gb/s both give ~10.5 tok/s single-stream.**
+  The full 111 Gb/s pays off for **concurrency / aggregate throughput** (more simultaneous requests), which
+  at high context is bounded by **KV-cache memory**, not the link.
+- **EAGLE3 (Phase 2) stacks +25%** on top of this on the single-stream path.
+
+**Invite to tinker:** if you have measured higher single-stream or concurrent throughput on a switchless
+3-Spark RoCE mesh, or have the EAGLE3 draft beating +25%, please open an issue or PR.
 
 ## Credits
 
 Luke Alonso (`local-inference-lab/vllm` chthonic fork + `b12x` + the `MiniMax-M3-NVFP4` quant + the
-`fb63c9a` TP3 virtual-sharding commit). eugr (`eugr/spark-vllm-docker`, `docs/NETWORKING.md`) for the
-switchless 3-Spark RoCE mesh recipe (Phase 3). Inferact for the `MiniMax-M3-EAGLE3` draft (Phase 2).
+`fb63c9a` TP3 virtual-sharding commit). eugr (`eugr/spark-vllm-docker`, `docs/NETWORKING.md`) for the core
+switchless 3-Spark RoCE mesh recipe (Phase 3). Forum user **mashie** for the **cold-power-drain** tip that
+took raw `ib_write_bw` from ~12.8 Gb/s to 111.85 Gb/s. A **ChatGPT-assisted debugging pass** that isolated
+the baked-`LD_PRELOAD` local-inference NCCL shim. Inferact for the `MiniMax-M3-EAGLE3` draft (Phase 2).
 The NVIDIA DGX Spark forum community (thread *"MiniMax M3 NVFP4 for quad DGX Spark"*). Recipe assembled,
-OOM/Ray fixes diagnosed, and Phase 2 + Phase 3 added on a live 3-Spark cluster, 2026-06-15.
+OOM/Ray fixes diagnosed, and Phase 2 + Phase 3 (RoCE SOLVED) completed on a live 3-Spark cluster, 2026-06-15.

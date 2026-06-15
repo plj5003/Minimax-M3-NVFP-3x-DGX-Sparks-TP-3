@@ -29,11 +29,25 @@ export NCCL_IB_DISABLE=0
 export NCCL_NET=IB
 export NCCL_SOCKET_IFNAME=enP7s7 GLOO_SOCKET_IFNAME=enP7s7
 export NCCL_IB_HCA=rocep1s0f0,rocep1s0f1
-export NCCL_IB_GID_INDEX=3
+# CRITICAL: do NOT hardcode NCCL_IB_GID_INDEX. Leaving it at default (-1) lets NCCL dynamically
+# select the correct RoCEv2 GID per-peer by CIDR via NCCL_IB_ADDR_RANGE. That dynamic selection IS
+# how subnet-aware-routing pairs the right local HCA to each neighbor on the switchless /30 mesh.
+# Hardcoding GID_INDEX=3 DISABLES it -> NCCL cross-pairs HCAs (e.g. the reddie-facing HCA dials the
+# bluey leg) -> ibv_modify_qp err 110 Connection timed out. (Diagnosed 2026-06-15; NCCL_IB_ADDR_RANGE
+# only takes effect when GID index is unset. Credit: ChatGPT via Tony + NVIDIA NCCL env docs.)
+export NCCL_IB_ADDR_RANGE=192.168.100.0/22
 export NCCL_IB_MERGE_NICS=0
 export NCCL_NET_PLUGIN=none
 export NCCL_IB_SUBNET_AWARE_ROUTING=1
-export NCCL_CUMEM_ENABLE=0 NCCL_IGNORE_CPU_AFFINITY=1 NCCL_DEBUG=INFO
+# CROSS_NIC=1 (ChatGPT 5.5 review 2026-06-15): THE fix for this asymmetric switchless mesh. Each node's
+# rocep1s0f0 faces a DIFFERENT neighbor, so NCCL's default same-index HCA pairing dials a non-cabled /30
+# -> err 110. CROSS_NIC=1 lets the ring/tree use different-numbered NICs on each node. Plus explicit
+# RoCEv2/IPv4 defaults, and NET_GDR_LEVEL=LOC disables GPUDirect RDMA (GB10 unified-memory safety).
+export NCCL_CROSS_NIC=1
+export NCCL_IB_ADDR_FAMILY=AF_INET
+export NCCL_IB_ROCE_VERSION_NUM=2
+export NCCL_NET_GDR_LEVEL=LOC
+export NCCL_CUMEM_ENABLE=0 NCCL_IGNORE_CPU_AFFINITY=1 NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH,ENV
 export HF_HOME=/cache/huggingface HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export RAY_DEDUP_LOGS=0
 export RAY_memory_monitor_refresh_ms=0
@@ -50,6 +64,21 @@ fi
 if ! python -c "import inspect; from b12x.integration.paged_attention_scratch import B12XPagedAttentionScratchCaps as C; raise SystemExit(0 if 'copy_runtime_metadata' in inspect.signature(C.__init__).parameters else 1)" 2>/dev/null; then
   echo "Upgrading b12x -> master (08e980c)..."
   pip install -q --force-reinstall --no-deps git+https://github.com/lukealonso/b12x.git@08e980c303b0b6291700a6b85aa09aa874fc27cb 2>&1 | tail -3
+fi
+
+# Force the host-built NCCL v2.30u1 to actually load. The ray/b12x pip installs above reinstall the
+# nvidia-nccl wheel (2.30.4) and clobber our symlink, so the cluster was running 2.30.4 not 2.30u1
+# (confirmed via the runtime banner). eugr's working mesh recipe specifically needs 2.30u1, so re-point
+# the symlink, prepend our build dir to LD_LIBRARY_PATH, and override the baked local-inference NCCL
+# LD_PRELOAD AFTER the pip installs. (2026-06-15)
+PIPNCCL=/opt/venv/lib/python3.12/site-packages/nvidia/nccl/lib
+if [ -e /opt/nccl230/build/lib/libnccl.so.2 ]; then
+  rm -f "$PIPNCCL/libnccl.so.2" 2>/dev/null
+  ln -sf /opt/nccl230/build/lib/libnccl.so.2 "$PIPNCCL/libnccl.so.2"
+  unset VLLM_NCCL_SO_PATH NCCL_LOCAL_INFERENCE_PATH NCCL_PR2127_PATH
+  export LD_PRELOAD=/opt/nccl230/build/lib/libnccl.so.2
+  export LD_LIBRARY_PATH=/opt/nccl230/build/lib:${LD_LIBRARY_PATH}
+  python -c "import ctypes;l=ctypes.CDLL('/opt/nccl230/build/lib/libnccl.so.2');v=ctypes.c_int();l.ncclGetVersion(ctypes.byref(v));print('FORCED_NCCL_VERSION',v.value)" 2>/dev/null || true
 fi
 
 sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
