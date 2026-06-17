@@ -1,3 +1,18 @@
+## 🚀 Quickstart — turnkey (pull the published image, no build)
+
+The full working image is published to GHCR — **no need to build chthonic yourself**:
+
+```bash
+docker pull ghcr.io/tonyd2wild/vllm-m3-chthonic:nccl230u1   # full NCCL/RoCE build (recommended)
+# or: docker pull ghcr.io/tonyd2wild/vllm-m3-chthonic:latest   # base chthonic
+```
+
+Then run the multi-node launcher (`m3vllm.sh`, in this repo) **inside** that container across your 3× DGX Spark — head node + 2 workers — exactly as documented below. Everything you need is this repo + that image.
+
+**For agents:** point your agent at this repo; the image above + the scripts here are the complete, verified recipe.
+
+---
+
 # MiniMax-M3 (NVFP4) serving at Tensor-Parallel = 3 across 3× DGX Spark (GB10 / sm_121)
 
 A **working, verified** recipe for running `lukealonso/MiniMax-M3-NVFP4` (~243 GB, 428B-A23B MoE)
