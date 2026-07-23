@@ -108,7 +108,7 @@ exec vllm serve /cache/huggingface/hub/models--lukealonso--MiniMax-M3-NVFP4 \
   --cudagraph-capture-sizes 1 2 \
   --block-size 128 \
   --load-format safetensors \
-  --max-model-len 262144 \
+  --max-model-len 245760 \
   --max-num-seqs 2 \
   --max-num-batched-tokens 4096 \
   --enable-chunked-prefill \
