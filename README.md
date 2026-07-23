@@ -255,6 +255,14 @@ Updated `--gpu-memory-utilization 0.83` and `--max-model-len 262144`. Expands pe
 ### 6. NVIDIA DSpark Speculative Decoding Roadmap (nvidia/MiniMax-M3-DSpark)
 Unlike EAGLE-3 (which failed on TP=3 due to 64->96 head divisibility conflicts), **DFlash / DSpark** (by Z Lab, ICML 2026 & NVIDIA) uses a lightweight **block diffusion model** to generate an entire block of future candidate tokens (4-8 tokens) in a single non-autoregressive forward pass. NVIDIA officially released [`nvidia/MiniMax-M3-DSpark`](https://huggingface.co/nvidia/MiniMax-M3-DSpark) on Hugging Face as the native draft head for MiniMax-M3 on DGX Spark. Passing `--speculative-model nvidia/MiniMax-M3-DSpark` is expected to unlock **18-25+ tok/s** decode throughput over RoCE 200G.
 
+### 7. Head Node Hardware Mod Roadmap: Morefine G2 OCuLink eGPU + USB 3.2 OS Boot
+- **Hardware Hack:** Adapt the internal M.2 NVMe slot on Head Node (`gx10-0d82`) via an M.2-to-OCuLink adapter to attach a **Morefine G2 eGPU (NVIDIA RTX 5060 Ti 16GB GDDR7)**.
+- **OS Boot Relocation:** Migrate the Ubuntu 24.04 ARM64 OS `/` root partition to a 20 Gbps USB 3.2 Gen 2x2 external SSD (~2,000 MB/s sequential throughput).
+- **Architecture Benefits:** 
+  1. Offloads `nvidia/MiniMax-M3-DSpark` draft model inference and local embedding models (BGE-M3/Qwen-Coder) 100% onto `cuda:1` (16GB GDDR7 VRAM).
+  2. Preserves 100% of the GB10 host's 128GB LPDDR5X RAM for the 428B target model and 256K FP8 KV cache.
+  3. Uses raw PCIe Gen4/Gen5 x4 zero-latency OCuLink signal directly into the ARM64 host root complex.
+
 ## Credits & links
 
 - **Luke Alonso** — `local-inference-lab/vllm` chthonic fork + `b12x` + the `MiniMax-M3-NVFP4` quant + the `fb63c9a` TP3 virtual-sharding commit.
