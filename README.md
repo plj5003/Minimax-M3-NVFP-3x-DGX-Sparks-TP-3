@@ -261,9 +261,10 @@ Unlike EAGLE-3 (which failed on TP=3 due to 64→96 head divisibility conflicts)
 - **Hardware Hack:** Adapt the internal M.2 NVMe slot on Head Node (`gx10-0d82`) via an M.2-to-OCuLink adapter to attach a **Morefine G2 eGPU (NVIDIA RTX 5060 Ti 16GB GDDR7)**.
 - **OS Boot Relocation:** Migrate the Ubuntu 24.04 ARM64 OS `/` root partition to a 20 Gbps USB 3.2 Gen 2x2 external SSD (~2,000 MB/s sequential throughput).
 - **Architecture Benefits:** 
-  1. Offloads `nvidia/MiniMax-M3-DSpark` draft model inference and local embedding models (BGE-M3/Qwen-Coder) 100% onto `cuda:1` (16GB GDDR7 VRAM).
-  2. Preserves 100% of the GB10 host's 128GB LPDDR5X RAM for the 428B target model and 256K FP8 KV cache.
-  3. Uses raw PCIe Gen4/Gen5 x4 zero-latency OCuLink signal directly into the ARM64 host root complex.
+  1. Offloads speculative decoding draft models (`Inferact/MiniMax-M3-EAGLE3-GQA` or `nvidia/MiniMax-M3-DSpark`) and local embedding models (BGE-M3/Qwen-Coder) 100% onto `cuda:1` (16GB GDDR7 VRAM).
+  2. Recommended Model Pairing: `sparkarena/Minimax-M3-v0-NVFP4-REAP25` (REAP25 MoE routing-stabilized target on TP=3) + `Inferact/MiniMax-M3-EAGLE3-GQA` (GQA lightweight draft on eGPU `cuda:1`).
+  3. Preserves 100% of the GB10 host's 128GB LPDDR5X RAM for the 428B target model and 200K FP8 KV cache.
+  4. Uses raw PCIe Gen4/Gen5 x4 zero-latency OCuLink signal directly into the ARM64 host root complex. Expected decode throughput: **33 – 38 tok/s**.
 
 ## Credits & links
 
