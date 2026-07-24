@@ -98,7 +98,7 @@ exec vllm serve /cache/huggingface/hub/models--lukealonso--MiniMax-M3-NVFP4 \
   --trust-remote-code \
   --tensor-parallel-size 3 \
   --distributed-executor-backend ray \
-  --gpu-memory-utilization 0.83 \
+  --gpu-memory-utilization 0.84 \
   --quantization modelopt_fp4 \
   --kv-cache-dtype fp8_e4m3 \
   --attention-backend B12X_ATTN \
