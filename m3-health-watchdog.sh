@@ -1,6 +1,6 @@
 #!/bin/bash
 # Self-Healing Health Watchdog for MiniMax-M3 Proxy Stack
-HEALTH_URL="http://127.0.0.1:8009/__health"
+HEALTH_URL="http://127.0.0.1:8001/v1/models"
 FAIL_COUNT=0
 MAX_FAILS=3
 
